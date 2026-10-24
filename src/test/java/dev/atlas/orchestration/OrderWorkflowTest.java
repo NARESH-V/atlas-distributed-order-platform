@@ -6,11 +6,13 @@ import io.temporal.testing.TestWorkflowEnvironment;
 import io.temporal.worker.Worker;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.mockito.Mockito.*;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class OrderWorkflowTest {
     private static final String TASK_QUEUE = "atlas-orders-test";
@@ -19,7 +21,7 @@ class OrderWorkflowTest {
     void completesOrderWhenActivitiesSucceed() {
         try (TestWorkflowEnvironment env = TestWorkflowEnvironment.newInstance()) {
             Worker worker = env.newWorker(TASK_QUEUE);
-            OrderActivities activities = mock(OrderActivities.class);
+            RecordingOrderActivities activities = new RecordingOrderActivities(false);
             worker.registerWorkflowImplementationTypes(OrderWorkflowImpl.class);
             worker.registerActivitiesImplementations(activities);
             env.start();
@@ -33,10 +35,11 @@ class OrderWorkflowTest {
                     new CreateOrderCommand(id, "SKU-123", 2, 2599, "USD"));
 
             assertEquals(OrderStatus.COMPLETED, result.status());
-            verify(activities).reserveInventory("SKU-123", 2, id + ":reserve");
-            verify(activities).authorizePayment(id.toString(), 2599, "USD", id + ":authorize");
-            verify(activities).requestShipment(id.toString(), id + ":ship");
-            verifyNoMoreInteractions(activities);
+            assertEquals(List.of(
+                    "reserve:SKU-123:2:" + id + ":reserve",
+                    "authorize:" + id + ":2599:USD:" + id + ":authorize",
+                    "ship:" + id + ":" + id + ":ship"
+            ), activities.calls);
         }
     }
 
@@ -44,9 +47,7 @@ class OrderWorkflowTest {
     void compensatesInventoryWhenPaymentFails() {
         try (TestWorkflowEnvironment env = TestWorkflowEnvironment.newInstance()) {
             Worker worker = env.newWorker(TASK_QUEUE);
-            OrderActivities activities = mock(OrderActivities.class);
-            doThrow(new IllegalStateException("simulated payment failure"))
-                    .when(activities).authorizePayment(anyString(), anyLong(), anyString(), anyString());
+            RecordingOrderActivities activities = new RecordingOrderActivities(true);
             worker.registerWorkflowImplementationTypes(OrderWorkflowImpl.class);
             worker.registerActivitiesImplementations(activities);
             env.start();
@@ -61,8 +62,51 @@ class OrderWorkflowTest {
 
             assertNotNull(result.message());
             assertEquals(OrderStatus.FAILED, result.status());
-            verify(activities).releaseInventory("SKU-123", 1, id + ":release");
-            verify(activities, never()).voidPaymentAuthorization(anyString(), anyString());
+            assertEquals(1, activities.calls.stream().filter(call -> call.equals(
+                    "reserve:SKU-123:1:" + id + ":reserve")).count());
+            assertEquals(3, activities.calls.stream().filter(call -> call.equals(
+                    "authorize:" + id + ":1000:USD:" + id + ":authorize")).count());
+            assertTrue(activities.calls.contains("release:SKU-123:1:" + id + ":release"));
+            assertTrue(activities.calls.stream().noneMatch(call -> call.startsWith("void:")));
+            assertTrue(activities.calls.stream().noneMatch(call -> call.startsWith("ship:")));
+        }
+    }
+
+    private static final class RecordingOrderActivities implements OrderActivities {
+        private final List<String> calls = new ArrayList<>();
+        private final boolean failPayment;
+
+        private RecordingOrderActivities(boolean failPayment) {
+            this.failPayment = failPayment;
+        }
+
+        @Override
+        public void reserveInventory(String sku, int quantity, String idempotencyKey) {
+            calls.add("reserve:" + sku + ":" + quantity + ":" + idempotencyKey);
+        }
+
+        @Override
+        public void authorizePayment(String orderId, long amountInMinorUnits, String currency,
+                                     String idempotencyKey) {
+            calls.add("authorize:" + orderId + ":" + amountInMinorUnits + ":" + currency + ":" + idempotencyKey);
+            if (failPayment) {
+                throw new IllegalStateException("simulated payment failure");
+            }
+        }
+
+        @Override
+        public void requestShipment(String orderId, String idempotencyKey) {
+            calls.add("ship:" + orderId + ":" + idempotencyKey);
+        }
+
+        @Override
+        public void releaseInventory(String sku, int quantity, String idempotencyKey) {
+            calls.add("release:" + sku + ":" + quantity + ":" + idempotencyKey);
+        }
+
+        @Override
+        public void voidPaymentAuthorization(String orderId, String idempotencyKey) {
+            calls.add("void:" + orderId + ":" + idempotencyKey);
         }
     }
 }
